@@ -40,7 +40,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = Path(os.environ.get("OPENCLAW_SEVA_CONFIG", "/root/.openclaw/seva/config.json"))
 
 from memory.episodic import EpisodicMemory  # type: ignore
-from memory.semantic import SemanticMemory  # type: ignore
+from memory.semantic import SemanticMemory, SentenceTransformersEmbedder  # type: ignore
 
 try:
     from reasoning.truth_engine import TitanMindCore  # type: ignore
@@ -66,6 +66,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "episodic": True,
         "semantic": True,
         "semantic_collection": "openclaw_seva",
+        "embed_model": "all-MiniLM-L6-v2",
         "store_all": True,
     },
     "verification": {"enabled": True, "wikipedia": True, "max_sources": 1},
@@ -104,6 +105,14 @@ def dotted_set(cfg: Dict[str, Any], pair: str) -> None:
                 cast = float(val)
             except ValueError:
                 cast = val
+PRESETS_PATH = Path(os.environ.get("OPENCLAW_SEVA_PRESETS", str(Path(__file__).resolve().parent / "presets.json")))
+
+def load_presets() -> Dict[str, Any]:
+    try:
+        return json.loads(PRESETS_PATH.read_text())
+    except Exception:
+        return {"modes": {}}
+
 
     cur: Any = cfg
     parts = key.split(".")
@@ -117,14 +126,26 @@ def dotted_set(cfg: Dict[str, Any], pair: str) -> None:
 class SevaService:
     def __init__(self) -> None:
         self.cfg = load_config()
+        self._embed_model = self.cfg.get("memory", {}).get("embed_model", "all-MiniLM-L6-v2")
         self.episodic = EpisodicMemory(DATA_DIR / "episodic.db")
         self.semantic = SemanticMemory(
             DATA_DIR / "semantic",
             collection_name=self.cfg.get("memory", {}).get("semantic_collection", "openclaw_seva"),
+            embedder=SentenceTransformersEmbedder(model_name=self._embed_model),
         )
 
     def refresh_cfg(self) -> None:
-        self.cfg = load_config()
+        new_cfg = load_config()
+        new_model = new_cfg.get("memory", {}).get("embed_model", "all-MiniLM-L6-v2")
+        if getattr(self, '_embed_model', None) != new_model:
+            self._embed_model = new_model
+            # rebuild semantic memory with new embedder
+            self.semantic = SemanticMemory(
+                DATA_DIR / "semantic",
+                collection_name=new_cfg.get("memory", {}).get("semantic_collection", "openclaw_seva"),
+                embedder=SentenceTransformersEmbedder(model_name=self._embed_model),
+            )
+        self.cfg = new_cfg
 
     def status(self) -> Dict[str, Any]:
         self.refresh_cfg()
@@ -286,7 +307,30 @@ def main() -> None:
         body = await request.json()
         return web.json_response(svc.score(body.get("text", "")))
 
-    @routes.post("/verify")
+    
+    @routes.post("/mode-set")
+    async def _mode_set(request: web.Request):
+        body = await request.json()
+        mode = (body.get("mode") or "").strip()
+        presets = load_presets().get("modes", {})
+        if mode not in presets:
+            return web.json_response({"success": False, "error": f"unknown_mode: {mode}", "modes": sorted(presets.keys())}, status=400)
+        cfg = load_config()
+        # apply preset dotted keys
+        for k, v in presets[mode].items():
+            # write into cfg via dotted path
+            cur = cfg
+            parts = k.split(".")
+            for p2 in parts[:-1]:
+                if p2 not in cur or not isinstance(cur[p2], dict):
+                    cur[p2] = {}
+                cur = cur[p2]
+            cur[parts[-1]] = v
+        cfg.setdefault("runtime", {})["mode"] = mode
+        save_config(cfg)
+        return web.json_response({"success": True, "mode": mode, "config": cfg})
+
+@routes.post("/verify")
     async def _verify(request: web.Request):
         body = await request.json()
         return web.json_response(await svc.verify(body.get("claim", "")))

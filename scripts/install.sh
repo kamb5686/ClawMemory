@@ -37,7 +37,8 @@ else
 fi
 
 echo "Installing SEVA server..."
-cp -f "${REPO_DIR}/seva/seva_server.py" "${SEVA_ROOT}/seva_server.py"
+cp -f "/seva/seva_server.py" "/seva_server.py"
+cp -f "/seva/presets.json" "/presets.json"
 chmod +x "${SEVA_ROOT}/seva_server.py"
 
 if [[ "${UNAME}" == "Linux" ]]; then

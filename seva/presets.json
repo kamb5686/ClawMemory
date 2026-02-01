@@ -1,0 +1,19 @@
+{
+  "modes": {
+    "lite": {
+      "memory.embed_model": "all-MiniLM-L6-v2",
+      "memory.store_all": true,
+      "verification.max_sources": 1
+    },
+    "standard": {
+      "memory.embed_model": "BAAI/bge-base-en-v1.5",
+      "memory.store_all": true,
+      "verification.max_sources": 2
+    },
+    "pro": {
+      "memory.embed_model": "BAAI/bge-large-en-v1.5",
+      "memory.store_all": true,
+      "verification.max_sources": 3
+    }
+  }
+}
