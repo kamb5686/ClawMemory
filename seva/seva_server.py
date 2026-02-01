@@ -21,12 +21,13 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 
 from aiohttp import web
 import aiohttp
@@ -70,7 +71,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "semantic_collection": "openclaw_seva",
         "embed_model": "all-MiniLM-L6-v2",
         "store_all": True,
+        "retention": {
+            # Hard cap on semantic items (0 disables pruning).
+            "max_items": 0,
+            # oldest | least_reinforced
+            "prune_policy": "oldest",
+        },
+        "temporal": {
+            # Exponential decay by age in days: score *= exp(-decay_rate * age_days)
+            "decay_rate": 0.0,
+            # Added bonus: score += reinforcement_boost * reinforcement
+            "reinforcement_boost": 0.0,
+            # How many top semantic hits to reinforce per recall.
+            "reinforce_top_k": 3,
+        },
     },
+    # Back-compat / shorthand (also supported): reinforcement_boost
+    "reinforcement_boost": 0.0,
     "verification": {
         "enabled": True,
         "max_sources": 1,
@@ -78,7 +95,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "wikipedia": True,
         "sympy": {"enabled": False},
         "wolfram": {"enabled": False, "appid": ""},
-        "false_confidence_threshold": 0.85
+        "false_confidence_threshold": 0.85,
     },
     "scoring": {"enabled": True},
 }
@@ -139,6 +156,7 @@ def load_presets() -> Dict[str, Any]:
 class SevaService:
     def __init__(self) -> None:
         self.cfg = load_config()
+        self._http: Optional[aiohttp.ClientSession] = None
         self._embed_model = self.cfg.get("memory", {}).get("embed_model", "all-MiniLM-L6-v2")
         self.episodic = EpisodicMemory(DATA_DIR / "episodic.db")
         self.semantic = SemanticMemory(
@@ -191,6 +209,172 @@ class SevaService:
             "deps": {"titanmind": TitanMindCore is not None, "wikipedia_checker": WikipediaFactChecker is not None},
         }
 
+    def _get_retention_cfg(self) -> Tuple[int, str]:
+        mem = self.cfg.get("memory", {}) if isinstance(self.cfg.get("memory", {}), dict) else {}
+        r = mem.get("retention", {}) if isinstance(mem.get("retention", {}), dict) else {}
+        max_items = int(r.get("max_items", 0) or 0)
+        policy = str(r.get("prune_policy", "oldest") or "oldest").strip() or "oldest"
+        return max_items, policy
+
+    def _get_temporal_cfg(self) -> Tuple[float, float, int]:
+        mem = self.cfg.get("memory", {}) if isinstance(self.cfg.get("memory", {}), dict) else {}
+        t = mem.get("temporal", {}) if isinstance(mem.get("temporal", {}), dict) else {}
+        decay_rate = float(t.get("decay_rate", 0.0) or 0.0)
+        # support either memory.temporal.reinforcement_boost or root reinforcement_boost
+        reinforcement_boost = t.get("reinforcement_boost", None)
+        if reinforcement_boost is None:
+            reinforcement_boost = self.cfg.get("reinforcement_boost", 0.0)
+        reinforcement_boost = float(reinforcement_boost or 0.0)
+        reinforce_top_k = int(t.get("reinforce_top_k", 3) or 0)
+        return decay_rate, reinforcement_boost, max(0, reinforce_top_k)
+
+    @staticmethod
+    def _age_days(ts: Optional[float]) -> float:
+        if ts is None:
+            return 0.0
+        try:
+            age_sec = max(0.0, time.time() - float(ts))
+        except Exception:
+            return 0.0
+        return age_sec / 86400.0
+
+    @staticmethod
+    def _decay_factor(age_days: float, decay_rate: float) -> float:
+        if decay_rate <= 0.0:
+            return 1.0
+        return float(math.exp(-decay_rate * max(0.0, age_days)))
+
+    @staticmethod
+    def _adjusted_score(similarity: float, age_days: float, reinforcement: float, decay_rate: float, reinforcement_boost: float) -> float:
+        sim = float(similarity or 0.0)
+        r = float(reinforcement or 0.0)
+        base = sim * SevaService._decay_factor(age_days, decay_rate)
+        return base + (reinforcement_boost * r)
+
+    def semantic_memory_status(self) -> Dict[str, Any]:
+        self.refresh_cfg()
+        max_items, policy = self._get_retention_cfg()
+        decay_rate, reinforcement_boost, reinforce_top_k = self._get_temporal_cfg()
+
+        # Best-effort glimpse of age/reinforcement distribution.
+        oldest_ts: Optional[float] = None
+        newest_ts: Optional[float] = None
+        min_reinf: Optional[float] = None
+        max_reinf: Optional[float] = None
+        try:
+            sample = self.semantic.collection.get(include=["metadatas"], limit=200)  # type: ignore[attr-defined]
+            metas = sample.get("metadatas") or []
+            for md in metas:
+                if not isinstance(md, dict):
+                    continue
+                ts = md.get("timestamp")
+                if isinstance(ts, (int, float)):
+                    oldest_ts = ts if oldest_ts is None else min(oldest_ts, float(ts))
+                    newest_ts = ts if newest_ts is None else max(newest_ts, float(ts))
+                r = md.get("reinforcement")
+                if isinstance(r, (int, float)):
+                    min_reinf = r if min_reinf is None else min(min_reinf, float(r))
+                    max_reinf = r if max_reinf is None else max(max_reinf, float(r))
+        except Exception:
+            pass
+
+        return {
+            "enabled": bool(self.cfg.get("enabled", True) and self.cfg.get("memory", {}).get("semantic", True)),
+            "items": self.semantic.size(),
+            "retention": {"max_items": max_items, "prune_policy": policy},
+            "temporal": {"decay_rate": decay_rate, "reinforcement_boost": reinforcement_boost, "reinforce_top_k": reinforce_top_k},
+            "sample": {
+                "oldest_timestamp": oldest_ts,
+                "newest_timestamp": newest_ts,
+                "min_reinforcement": min_reinf,
+                "max_reinforcement": max_reinf,
+            },
+        }
+
+    def prune_semantic_memory(self, *, max_items: Optional[int] = None, policy: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+        self.refresh_cfg()
+        cfg_max, cfg_policy = self._get_retention_cfg()
+        cap = int(cfg_max if max_items is None else max_items)
+        pol = str(cfg_policy if policy is None else policy).strip() or "oldest"
+
+        total = self.semantic.size()
+        if cap <= 0 or total <= cap:
+            return {"success": True, "dry_run": dry_run, "policy": pol, "cap": cap, "before": total, "deleted": 0, "after": total, "ids": []}
+
+        to_delete = total - cap
+
+        # Load ids + metadatas in batches (Chroma supports offset/limit in recent versions).
+        rows: List[Tuple[str, Dict[str, Any]]] = []
+        limit = 1000
+        offset = 0
+        while True:
+            try:
+                batch = self.semantic.collection.get(include=["metadatas"], limit=limit, offset=offset)  # type: ignore[attr-defined]
+            except TypeError:
+                # Older chroma: no offset param.
+                batch = self.semantic.collection.get(include=["metadatas"], limit=limit)  # type: ignore[attr-defined]
+            ids = batch.get("ids") or []
+            metas = batch.get("metadatas") or []
+            if not ids:
+                break
+            for i, doc_id in enumerate(ids):
+                md = metas[i] if i < len(metas) else {}
+                rows.append((str(doc_id), md if isinstance(md, dict) else {}))
+            if len(ids) < limit:
+                break
+            offset += limit
+            if offset > 500000:
+                break
+
+        def sort_key(md: Dict[str, Any]) -> Tuple[float, float]:
+            ts = md.get("timestamp")
+            tsf = float(ts) if isinstance(ts, (int, float)) else 0.0
+            reinf = md.get("reinforcement")
+            rf = float(reinf) if isinstance(reinf, (int, float)) else 0.0
+            if pol == "least_reinforced":
+                return (rf, tsf)
+            # default: oldest
+            return (tsf, rf)
+
+        rows.sort(key=lambda pair: sort_key(pair[1]))
+        ids = [doc_id for (doc_id, _md) in rows[:to_delete]]
+
+        if not dry_run and ids:
+            self.semantic.delete(ids)
+
+        after = self.semantic.size() if not dry_run else total
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "policy": pol,
+            "cap": cap,
+            "before": total,
+            "deleted": len(ids),
+            "after": after,
+            "ids": ids[:50],
+        }
+
+    def _reinforce_semantic(self, doc_id: str, metadata: Dict[str, Any]) -> None:
+        try:
+            current = self.semantic.get(doc_id)
+            if not current:
+                return
+            md = dict(current.get("metadata") or {})
+            md.update(metadata or {})
+            md["last_accessed"] = time.time()
+            md["reinforcement"] = float(md.get("reinforcement", 0.0) or 0.0) + 1.0
+            self.semantic.update(doc_id, current.get("text") or "", metadata=md)
+        except Exception:
+            return
+
+    def _enforce_retention(self) -> None:
+        max_items, policy = self._get_retention_cfg()
+        if max_items and max_items > 0 and self.semantic.size() > max_items:
+            try:
+                self.prune_semantic_memory(max_items=max_items, policy=policy, dry_run=False)
+            except Exception:
+                pass
+
     def recall(self, query: str, k: int) -> Dict[str, Any]:
         self.refresh_cfg()
         items = []
@@ -205,16 +389,46 @@ class SevaService:
                 })
 
         if self.cfg.get("enabled", True) and self.cfg.get("memory", {}).get("semantic", True):
+            decay_rate, reinforcement_boost, reinforce_top_k = self._get_temporal_cfg()
+            semantic_hits: List[Tuple[str, float, Dict[str, Any], str]] = []  # (id, adjusted_score, metadata, text)
+
             for r in self.semantic.search(query, k=k):
-                score = None
+                doc_id = str(r.get("id", ""))
+                md = r.get("metadata", {}) if isinstance(r.get("metadata", {}), dict) else {}
+                text = r.get("text", "")
+
+                similarity = None
                 if r.get("distance") is not None:
-                    score = 1.0 - float(r.get("distance"))
+                    similarity = 1.0 - float(r.get("distance"))
+                elif r.get("similarity") is not None:
+                    similarity = float(r.get("similarity"))
+
+                if similarity is None:
+                    score = None
+                else:
+                    age_days = self._age_days(md.get("timestamp"))
+                    reinforcement = md.get("reinforcement", 0.0)
+                    score = self._adjusted_score(similarity, age_days, reinforcement, decay_rate, reinforcement_boost)
+                    semantic_hits.append((doc_id, float(score), md, text))
+
                 items.append({
                     "source": "semantic",
-                    "text": r.get("text", ""),
-                    "metadata": r.get("metadata", {}),
+                    "id": doc_id,
+                    "text": text,
+                    "metadata": md,
                     "score": score,
                 })
+
+            # Reinforce top semantic items (best-effort) so repeated recalls keep them alive.
+            if reinforce_top_k > 0 and semantic_hits:
+                semantic_hits.sort(key=lambda t: t[1], reverse=True)
+                for doc_id, s, md, _text in semantic_hits[: min(reinforce_top_k, len(semantic_hits))]:
+                    if not doc_id:
+                        continue
+                    # avoid reinforcing totally-irrelevant matches
+                    if s <= 0.0:
+                        continue
+                    self._reinforce_semantic(doc_id, md)
 
         items.sort(key=lambda it: (0 if it["source"] == "semantic" else 1, -(it["score"] or 0.0)))
         return {"query": query, "k": k, "results": items[:k]}
@@ -233,10 +447,19 @@ class SevaService:
             )
 
         if self.cfg.get("memory", {}).get("semantic", True) and self.cfg.get("memory", {}).get("store_all", False):
+            now = time.time()
             self.semantic.store(
                 text=f"Q: {text}\nA: {response}",
-                metadata={"channel": channel, "sender": sender, "timestamp": time.time(), "text_length": len(text) + len(response) + 6},
+                metadata={
+                    "channel": channel,
+                    "sender": sender,
+                    "timestamp": now,
+                    "last_accessed": now,
+                    "reinforcement": 0.0,
+                    "text_length": len(text) + len(response) + 6,
+                },
             )
+            self._enforce_retention()
 
         return {"success": True}
 
@@ -512,6 +735,18 @@ def main() -> None:
             )
         )
 
+    @routes.get("/memory/status")
+    async def _memory_status(request: web.Request):
+        return web.json_response(svc.semantic_memory_status())
+
+    @routes.post("/memory/prune")
+    async def _memory_prune(request: web.Request):
+        body = await request.json()
+        max_items = body.get("max_items")
+        policy = body.get("policy")
+        dry_run = bool(body.get("dry_run", False))
+        return web.json_response(svc.prune_semantic_memory(max_items=max_items, policy=policy, dry_run=dry_run))
+
     @routes.post("/score")
     async def _score(request: web.Request):
         body = await request.json()
@@ -547,11 +782,16 @@ def main() -> None:
         return web.json_response(await svc.verify(body.get("claim", ""), providers=body.get("providers"), run_all=bool(body.get("all", False))))
 
     app = web.Application()
-    app.add_routes([web.get("/status", _status), web.get("/config", _config)])
+    app.add_routes([
+        web.get("/status", _status),
+        web.get("/config", _config),
+        web.get("/memory/status", _memory_status),
+    ])
     app.add_routes([
         web.post("/config-set", _config_set),
         web.post("/recall", _recall),
         web.post("/remember", _remember),
+        web.post("/memory/prune", _memory_prune),
         web.post("/score", _score),
         web.post("/verify", _verify),
     ])

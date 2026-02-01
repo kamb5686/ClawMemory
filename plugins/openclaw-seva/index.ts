@@ -84,6 +84,8 @@ function helpText() {
     "- /seva mode <name>         (set mode)",
     "- /seva mode list           (best-effort list)",
     "- /seva recall [k] <query>",
+    "- /seva memory status",
+    "- /seva memory prune [--dry-run] [--max N] [--policy oldest|least_reinforced]",
     "- /seva verify [--provider <name>] [--all] <claim>",
     "- /seva wolfram status|on|off|set <appid>",
     "- /seva doctor",
@@ -354,6 +356,57 @@ export default function register(api: any) {
           return { text: lines.join("\n") };
         }
 
+        if (subcmd === "memory") {
+          const action = String(restTokens[0] ?? "status").toLowerCase();
+
+          if (action === "status") {
+            const data = await fetchJson({ baseUrl, path: "/memory/status", timeoutMs });
+            return { text: formatJsonPreview(data, 1600) };
+          }
+
+          if (action === "prune") {
+            // flags: --dry-run, --max N, --policy name
+            const tokens = restTokens.slice(1);
+            let dryRun = false;
+            let maxItems: number | undefined;
+            let policy: string | undefined;
+
+            for (let i = 0; i < tokens.length; i++) {
+              const tok = tokens[i];
+              if (tok === "--dry-run") {
+                dryRun = true;
+                continue;
+              }
+              if (tok === "--max" && i + 1 < tokens.length) {
+                const n = Number(tokens[i + 1]);
+                if (Number.isFinite(n) && n >= 0) maxItems = Math.floor(n);
+                i += 1;
+                continue;
+              }
+              if (tok === "--policy" && i + 1 < tokens.length) {
+                policy = tokens[i + 1];
+                i += 1;
+                continue;
+              }
+            }
+
+            const body: any = { dry_run: dryRun };
+            if (maxItems != null) body.max_items = maxItems;
+            if (policy) body.policy = policy;
+
+            const data = await fetchJson({
+              baseUrl,
+              path: "/memory/prune",
+              method: "POST",
+              body,
+              timeoutMs: Math.max(timeoutMs, 8000),
+            });
+            return { text: formatJsonPreview(data, 1600) };
+          }
+
+          return { text: "Usage: /seva memory status | prune [--dry-run] [--max N] [--policy oldest|least_reinforced]" };
+        }
+
         if (subcmd === "verify") {
           if (!rest) {
             return { text: "Usage: /seva verify [--provider <name>] [--all] <claim>" };
@@ -395,7 +448,7 @@ export default function register(api: any) {
           return { text: formatJsonPreview(data, 1800) };
         }
 
-return { text: `Unknown subcommand: ${subcmd}\n\n${helpText()}` };
+        return { text: `Unknown subcommand: ${subcmd}\n\n${helpText()}` };
       } catch (e: any) {
         const detail = e?.data ? `\n\n${formatJsonPreview(e.data, 1200)}` : "";
         return { text: `SEVA request failed: ${String(e?.message ?? e)}${detail}` };
