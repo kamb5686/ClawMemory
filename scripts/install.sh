@@ -59,6 +59,9 @@ fi
 echo "Link/install hook pack into OpenClaw..."
 openclaw hooks install -l "${REPO_DIR}"
 
-echo "Done. Restart the gateway so hooks reload:"
+echo "Install SEVA plugin (adds /seva commands)..."
+openclaw plugins install -l "${REPO_DIR}/plugins/openclaw-seva" || true
+
+echo "Done. Restart the gateway so hooks/plugins reload:"
 
 echo "  openclaw gateway restart"

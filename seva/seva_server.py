@@ -220,6 +220,60 @@ class SevaService:
         score = tm.truth_score(text, drift, entropy)
         return {"success": True, "drift": drift, "entropy": entropy, "score": score}
 
+    async def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        return self._http
+
+    async def _wolfram_verify(self, claim: str) -> Optional[Dict[str, Any]]:
+        vcfg = self.cfg.get("verification", {}).get("wolfram", {})
+        enabled = bool(vcfg.get("enabled", False))
+        appid = (vcfg.get("appid", "") or os.environ.get("WOLFRAM_APPID", "")).strip()
+        if not enabled or not appid:
+            return None
+
+        # Wolfram|Alpha v2 query API (JSON)
+        url = f"https://api.wolframalpha.com/v2/query?appid={quote_plus(appid)}&input={quote_plus(claim)}&output=json"
+        session = await self._get_http()
+        async with session.get(url) as resp:
+            data = await resp.json(content_type=None)
+
+        qr = data.get("queryresult") if isinstance(data, dict) else None
+        if not isinstance(qr, dict):
+            return {"type": "wolfram", "ok": False, "error": "bad_response"}
+
+        success = bool(qr.get("success"))
+        pods = qr.get("pods")
+        evidence: List[str] = []
+        if isinstance(pods, list):
+            for pod in pods[:6]:
+                if not isinstance(pod, dict):
+                    continue
+                title = str(pod.get("title", "")).strip()
+                subpods = pod.get("subpods")
+                texts: List[str] = []
+                if isinstance(subpods, list):
+                    for sp in subpods:
+                        if isinstance(sp, dict) and sp.get("plaintext"):
+                            texts.append(str(sp.get("plaintext")).strip())
+                elif isinstance(subpods, dict) and subpods.get("plaintext"):
+                    texts.append(str(subpods.get("plaintext")).strip())
+                texts = [t for t in texts if t]
+                if texts:
+                    chunk = texts[0]
+                    if title:
+                        evidence.append(f"{title}: {chunk}")
+                    else:
+                        evidence.append(chunk)
+
+        return {
+            "type": "wolfram",
+            "ok": True,
+            "success": success,
+            "evidence": evidence[:5],
+            "raw": {"success": success, "numpods": qr.get("numpods"), "timing": qr.get("timing")},
+        }
+
     async def verify(self, claim: str) -> Dict[str, Any]:
         self.refresh_cfg()
         if not self.cfg.get("enabled", True) or not self.cfg.get("verification", {}).get("enabled", True):
@@ -230,6 +284,8 @@ class SevaService:
         if self.cfg.get("scoring", {}).get("enabled", True) and TitanMindCore is not None:
             out["score"] = self.score(claim)
 
+        # Provider pipeline (ordered, best-effort)
+        # 1) Wikipedia/Wikidata
         if self.cfg.get("verification", {}).get("wikipedia", False) and WikipediaFactChecker is not None:
             checker = WikipediaFactChecker()
             try:
@@ -243,7 +299,25 @@ class SevaService:
                 except Exception:
                     pass
 
-        out["verified"] = True if out.get("sources") else None
+        # 2) Wolfram|Alpha (optional)
+        try:
+            w = await self._wolfram_verify(claim)
+            if w is not None:
+                out["sources"].append(w)
+        except Exception as e:
+            out["issues"].append(f"wolfram_error: {e}")
+
+        # Determine verified if any provider returned strong true
+        verified = None
+        for src in out.get("sources", []):
+            if src.get("type") == "wikipedia":
+                for r in src.get("results", []) or []:
+                    if isinstance(r, dict) and r.get("verified") is True:
+                        verified = True
+                        break
+            if verified is True:
+                break
+        out["verified"] = verified
         return out
 
 
@@ -330,7 +404,8 @@ def main() -> None:
         save_config(cfg)
         return web.json_response({"success": True, "mode": mode, "config": cfg})
 
-@routes.post("/verify")
+
+    @routes.post("/verify")
     async def _verify(request: web.Request):
         body = await request.json()
         return web.json_response(await svc.verify(body.get("claim", "")))

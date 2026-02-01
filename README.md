@@ -1,32 +1,76 @@
 # ClawMemory
 
-ClawMemory contains the local **SEVA** service + OpenClaw integrations.
+ClawMemory is a **SEVA assist layer** for OpenClaw:
 
-## OpenClaw plugin (recommended)
+- **Memory**: episodic + semantic (ChromaDB)
+- **Verification**: Wikipedia/Wikidata now; Wolfram|Alpha optional
+- **Modes**: `lite`, `standard`, `pro` (quality presets)
+- **Plugin**: adds real OpenClaw commands (`/seva ...`) that bypass the LLM for deterministic control
 
-This repo ships an **OpenClaw plugin** that provides real chat commands:
-
-- `/seva status | mode | recall | verify | on | off | doctor`
-
-Plugin path:
-
-- `plugins/openclaw-seva`
-
-Install (local path):
+## Quickstart (Linux/macOS)
 
 ```bash
-git clone https://github.com/kamb5686/ClawMemory.git
+git clone https://github.com/kamb5686/ClawMemory
 cd ClawMemory
-
-openclaw plugins install -l ./plugins/openclaw-seva
-openclaw plugins enable clawmemory-seva
+bash ./scripts/install.sh
 openclaw gateway restart
 ```
 
-See [`plugins/openclaw-seva/README.md`](plugins/openclaw-seva/README.md) for full details.
+## Usage (in chat)
 
-## Existing hook pack
+Once the plugin is installed:
 
-This repo also includes a legacy hook pack at `hooks/seva-service` that checks whether
-SEVA is reachable on Gateway startup. The plugin includes a similar startup check,
-so the hook pack is optional.
+- `/seva status`
+- `/seva mode` (show current)
+- `/seva mode lite|standard|pro`
+- `/seva recall 8 what was that plan`
+- `/seva verify Barack Obama was born in 1961`
+- `/seva doctor`
+
+## Modes
+
+Modes are defined in `seva/presets.json`.
+
+- **lite**: fast + small embedding model
+- **standard**: balanced
+- **pro**: strongest embedding model
+
+Set a mode:
+
+```bash
+./scripts/seva.sh mode standard
+```
+
+Or in chat:
+
+```text
+/seva mode standard
+```
+
+## Verification providers
+
+### Wikipedia/Wikidata (default)
+Works well for entity/date-style claims.
+
+### Wolfram|Alpha (optional)
+Enable by setting:
+
+- `verification.wolfram.enabled=true`
+- `verification.wolfram.appid=<YOUR_APPID>`
+
+You can set it via API:
+
+```bash
+curl -sS -X POST http://127.0.0.1:18790/config-set \
+  -H 'content-type: application/json' \
+  -d '{"set":["verification.wolfram.enabled=true","verification.wolfram.appid=YOUR_APPID"]}'
+```
+
+Or via environment:
+
+- `WOLFRAM_APPID=...`
+
+## Notes
+
+- ClawMemory does **not** replace OpenClaw’s LLM; it augments it.
+- Store-all semantic memory can grow; monitor `~/.openclaw/seva/data/`.
