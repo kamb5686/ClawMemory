@@ -1,0 +1,9 @@
+{
+  "name": "@kamb/clawmemory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "hooks": ["./hooks/seva-service"]
+  }
+}

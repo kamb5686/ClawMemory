@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openclaw.seva</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>OPENCLAW_SEVA_HOST=127.0.0.1</string>
+    <string>OPENCLAW_SEVA_PORT=18790</string>
+    <string>OPENCLAW_SEVA_DATA_DIR=%HOME%/.openclaw/seva/data</string>
+    <string>OPENCLAW_SEVA_CONFIG=%HOME%/.openclaw/seva/config.json</string>
+    <string>%HOME%/.openclaw/seva/venv/bin/python</string>
+    <string>%HOME%/.openclaw/seva/seva_server.py</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>%HOME%/.openclaw/logs/seva.log</string>
+  <key>StandardErrorPath</key>
+  <string>%HOME%/.openclaw/logs/seva.log</string>
+</dict>
+</plist>

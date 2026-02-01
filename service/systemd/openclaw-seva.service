@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenClaw SEVA local service (memory+verification)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/seva
+ExecStart=/root/.openclaw/seva/venv/bin/python /root/.openclaw/seva/seva_server.py
+Restart=on-failure
+RestartSec=2
+Environment=OPENCLAW_SEVA_HOST=127.0.0.1
+Environment=OPENCLAW_SEVA_PORT=18790
+Environment=OPENCLAW_SEVA_DATA_DIR=/root/.openclaw/seva/data
+Environment=OPENCLAW_SEVA_CONFIG=/root/.openclaw/seva/config.json
+
+[Install]
+WantedBy=default.target
