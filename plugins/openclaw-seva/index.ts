@@ -292,22 +292,47 @@ export default function register(api: any) {
         }
 
         if (subcmd === "verify") {
-          const claim = rest;
-          if (!claim) {
-            return { text: "Usage: /seva verify <claim>" };
+          if (!rest) {
+            return { text: "Usage: /seva verify [--provider <name>] [--all] <claim>" };
           }
+
+          // flags: --provider <name>, --all
+          const tokens = restTokens.slice();
+          let provider = null;
+          let all = false;
+          const claimParts = [];
+          for (let i = 0; i < tokens.length; i++) {
+            const tok = tokens[i];
+            if (tok === "--all") {
+              all = true;
+              continue;
+            }
+            if (tok === "--provider" && i + 1 < tokens.length) {
+              provider = tokens[i + 1];
+              i += 1;
+              continue;
+            }
+            claimParts.push(tok);
+          }
+          const claim = claimParts.join(" ").trim();
+          if (!claim) return { text: "Usage: /seva verify [--provider <name>] [--all] <claim>" };
+
+          const body = { claim };
+          if (all) body.all = true;
+          if (provider) body.providers = [provider];
+
           const data = await fetchJson({
             baseUrl,
             path: "/verify",
             method: "POST",
-            body: { claim },
-            timeoutMs: Math.max(timeoutMs, 6000),
+            body,
+            timeoutMs: Math.max(timeoutMs, 8000),
           });
 
           return { text: formatJsonPreview(data, 1800) };
         }
 
-        return { text: `Unknown subcommand: ${subcmd}\n\n${helpText()}` };
+return { text: `Unknown subcommand: ${subcmd}\n\n${helpText()}` };
       } catch (e: any) {
         const detail = e?.data ? `\n\n${formatJsonPreview(e.data, 1200)}` : "";
         return { text: `SEVA request failed: ${String(e?.message ?? e)}${detail}` };

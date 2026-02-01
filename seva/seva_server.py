@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from aiohttp import web
+import aiohttp
+from urllib.parse import quote_plus
 
 SEVA_SRC = Path("/root/seva_openclaw")
 if str(SEVA_SRC) not in sys.path:
@@ -69,7 +71,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "embed_model": "all-MiniLM-L6-v2",
         "store_all": True,
     },
-    "verification": {"enabled": True, "wikipedia": True, "max_sources": 1},
+    "verification": {
+        "enabled": True,
+        "max_sources": 1,
+        "providers": ["wikipedia", "sympy", "wolfram"],
+        "wikipedia": True,
+        "sympy": {"enabled": False},
+        "wolfram": {"enabled": False, "appid": ""},
+        "false_confidence_threshold": 0.85
+    },
     "scoring": {"enabled": True},
 }
 
@@ -95,7 +105,9 @@ def dotted_set(cfg: Dict[str, Any], pair: str) -> None:
     if "=" not in pair:
         raise ValueError(f"Invalid set entry (expected key=value): {pair}")
     key, val = pair.split("=", 1)
-    if val.lower() in ("true", "false"):
+
+    # naive type casting
+    if isinstance(val, str) and val.lower() in ("true", "false"):
         cast: Any = val.lower() == "true"
     else:
         try:
@@ -105,14 +117,6 @@ def dotted_set(cfg: Dict[str, Any], pair: str) -> None:
                 cast = float(val)
             except ValueError:
                 cast = val
-PRESETS_PATH = Path(os.environ.get("OPENCLAW_SEVA_PRESETS", str(Path(__file__).resolve().parent / "presets.json")))
-
-def load_presets() -> Dict[str, Any]:
-    try:
-        return json.loads(PRESETS_PATH.read_text())
-    except Exception:
-        return {"modes": {}}
-
 
     cur: Any = cfg
     parts = key.split(".")
@@ -121,6 +125,15 @@ def load_presets() -> Dict[str, Any]:
             cur[p] = {}
         cur = cur[p]
     cur[parts[-1]] = cast
+
+
+PRESETS_PATH = Path(os.environ.get("OPENCLAW_SEVA_PRESETS", str(Path(__file__).resolve().parent / "presets.json")))
+
+def load_presets() -> Dict[str, Any]:
+    try:
+        return json.loads(PRESETS_PATH.read_text())
+    except Exception:
+        return {"modes": {}}
 
 
 class SevaService:
@@ -274,51 +287,158 @@ class SevaService:
             "raw": {"success": success, "numpods": qr.get("numpods"), "timing": qr.get("timing")},
         }
 
-    async def verify(self, claim: str) -> Dict[str, Any]:
+    async def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        return self._http
+
+    async def _verify_sympy(self, claim: str) -> Optional[Dict[str, Any]]:
+        vcfg = self.cfg.get("verification", {}).get("sympy", {})
+        if not bool(vcfg.get("enabled", False)):
+            return None
+
+        try:
+            import sympy as sp
+        except Exception as e:
+            return {"type": "sympy", "ok": False, "error": f"sympy_unavailable: {e}"}
+
+        raw = claim.strip()
+        # normalize
+        expr = raw.replace("^", "**")
+        # handle simple equality forms
+        if "==" in expr:
+            left, right = expr.split("==", 1)
+            left = left.strip(); right = right.strip()
+            try:
+                ok = sp.simplify(sp.sympify(left) - sp.sympify(right)) == 0
+                return {"type": "sympy", "ok": True, "asserted": bool(ok), "confidence": 0.95, "evidence": [f"simplify({left} - ({right})) == 0 -> {ok}"]}
+            except Exception as e:
+                return {"type": "sympy", "ok": False, "error": f"parse_error: {e}"}
+        if "=" in expr and expr.count("=") == 1:
+            left, right = expr.split("=", 1)
+            left = left.strip(); right = right.strip()
+            # avoid treating assignments like x=2 as verification
+            if any(ch.isalpha() for ch in left) and not any(ch.isalpha() for ch in right):
+                # still can be equation, allow
+                pass
+            try:
+                ok = sp.simplify(sp.sympify(left) - sp.sympify(right)) == 0
+                return {"type": "sympy", "ok": True, "asserted": bool(ok), "confidence": 0.95, "evidence": [f"simplify({left} - ({right})) == 0 -> {ok}"]}
+            except Exception as e:
+                return {"type": "sympy", "ok": False, "error": f"parse_error: {e}"}
+
+        # fallback: try evaluating numeric expression
+        try:
+            val = sp.N(sp.sympify(expr))
+            return {"type": "sympy", "ok": True, "asserted": None, "confidence": 0.4, "evidence": [f"eval -> {val}"]}
+        except Exception as e:
+            return {"type": "sympy", "ok": False, "error": f"parse_error: {e}"}
+
+    async def _verify_wolfram(self, claim: str) -> Optional[Dict[str, Any]]:
+        vcfg = self.cfg.get("verification", {}).get("wolfram", {})
+        enabled = bool(vcfg.get("enabled", False))
+        appid = (vcfg.get("appid", "") or os.environ.get("WOLFRAM_APPID", "")).strip()
+        if not enabled or not appid:
+            return None
+
+        url = f"https://api.wolframalpha.com/v2/query?appid={quote_plus(appid)}&input={quote_plus(claim)}&output=json"
+        session = await self._get_http()
+        async with session.get(url) as resp:
+            data = await resp.json(content_type=None)
+
+        qr = data.get("queryresult") if isinstance(data, dict) else None
+        if not isinstance(qr, dict):
+            return {"type": "wolfram", "ok": False, "error": "bad_response"}
+
+        success = bool(qr.get("success"))
+        pods = qr.get("pods")
+        evidence = []
+        if isinstance(pods, list):
+            for pod in pods[:6]:
+                if not isinstance(pod, dict):
+                    continue
+                title = str(pod.get("title", "")).strip()
+                subpods = pod.get("subpods")
+                texts = []
+                if isinstance(subpods, list):
+                    for sp in subpods:
+                        if isinstance(sp, dict) and sp.get("plaintext"):
+                            texts.append(str(sp.get("plaintext")).strip())
+                elif isinstance(subpods, dict) and subpods.get("plaintext"):
+                    texts.append(str(subpods.get("plaintext")).strip())
+                texts = [t for t in texts if t]
+                if texts:
+                    chunk = texts[0]
+                    evidence.append(f"{title}: {chunk}" if title else chunk)
+
+        # Wolfram is evidence, not truth; asserted stays null
+        return {"type": "wolfram", "ok": True, "asserted": None, "confidence": 0.6 if success else 0.2, "evidence": evidence[:5], "raw": {"success": success, "numpods": qr.get("numpods"), "timing": qr.get("timing")}}
+
+    async def verify(self, claim: str, providers: Optional[list[str]] = None, run_all: bool = False) -> Dict[str, Any]:
         self.refresh_cfg()
         if not self.cfg.get("enabled", True) or not self.cfg.get("verification", {}).get("enabled", True):
             return {"success": False, "error": "verification disabled"}
 
-        out: Dict[str, Any] = {"claim": claim, "verified": None, "issues": [], "sources": []}
+        vcfg = self.cfg.get("verification", {})
+        configured = vcfg.get("providers") if isinstance(vcfg.get("providers"), list) else ["wikipedia"]
+        ordered = providers or configured
 
+        out: Dict[str, Any] = {"claim": claim, "verified": None, "issues": [], "sources": []}
         if self.cfg.get("scoring", {}).get("enabled", True) and TitanMindCore is not None:
             out["score"] = self.score(claim)
 
-        # Provider pipeline (ordered, best-effort)
-        # 1) Wikipedia/Wikidata
-        if self.cfg.get("verification", {}).get("wikipedia", False) and WikipediaFactChecker is not None:
-            checker = WikipediaFactChecker()
+        false_thresh = float(vcfg.get("false_confidence_threshold", 0.85))
+
+        asserted_true = False
+        asserted_false = False
+
+        for name in ordered:
+            n = str(name).lower().strip()
+            if not n:
+                continue
             try:
-                results = await checker.extract_and_verify_claims(claim)
-                out["sources"].append({"type": "wikipedia", "results": [asdict(r) for r in results]})
+                if n in ("wiki", "wikipedia", "wikidata"):
+                    if self.cfg.get("verification", {}).get("wikipedia", False) and WikipediaFactChecker is not None:
+                        checker = WikipediaFactChecker()
+                        try:
+                            results = await checker.extract_and_verify_claims(claim)
+                            src = {"type": "wikipedia", "ok": True, "results": [asdict(r) for r in results]}
+                            out["sources"].append(src)
+                            for r in src["results"]:
+                                if isinstance(r, dict) and r.get("verified") is True:
+                                    asserted_true = True
+                        finally:
+                            try:
+                                await checker.close()
+                            except Exception:
+                                pass
+                elif n == "sympy":
+                    src = await self._verify_sympy(claim)
+                    if src is not None:
+                        out["sources"].append(src)
+                        if src.get("asserted") is True:
+                            asserted_true = True
+                        if src.get("asserted") is False and float(src.get("confidence", 0.0)) >= false_thresh:
+                            asserted_false = True
+                elif n == "wolfram":
+                    src = await self._verify_wolfram(claim)
+                    if src is not None:
+                        out["sources"].append(src)
+                else:
+                    out["issues"].append(f"unknown_provider: {n}")
             except Exception as e:
-                out["issues"].append(f"wikipedia_checker_error: {e}")
-            finally:
-                try:
-                    await checker.close()
-                except Exception:
-                    pass
+                out["issues"].append(f"provider_error:{n}:{e}")
 
-        # 2) Wolfram|Alpha (optional)
-        try:
-            w = await self._wolfram_verify(claim)
-            if w is not None:
-                out["sources"].append(w)
-        except Exception as e:
-            out["issues"].append(f"wolfram_error: {e}")
-
-        # Determine verified if any provider returned strong true
-        verified = None
-        for src in out.get("sources", []):
-            if src.get("type") == "wikipedia":
-                for r in src.get("results", []) or []:
-                    if isinstance(r, dict) and r.get("verified") is True:
-                        verified = True
-                        break
-            if verified is True:
+            if not run_all and asserted_true:
+                # if any provider strongly verifies true, we can stop early
                 break
-        out["verified"] = verified
+            if not run_all and asserted_false:
+                out["verified"] = False
+                return out
+
+        out["verified"] = True if asserted_true else (False if asserted_false else None)
         return out
+
 
 
 async def json_response(handler):
@@ -408,7 +528,7 @@ def main() -> None:
     @routes.post("/verify")
     async def _verify(request: web.Request):
         body = await request.json()
-        return web.json_response(await svc.verify(body.get("claim", "")))
+        return web.json_response(await svc.verify(body.get("claim", ""), providers=body.get("providers"), run_all=bool(body.get("all", False))))
 
     app = web.Application()
     app.add_routes([web.get("/status", _status), web.get("/config", _config)])

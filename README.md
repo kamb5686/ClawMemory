@@ -74,3 +74,12 @@ Or via environment:
 
 - ClawMemory does **not** replace OpenClaw’s LLM; it augments it.
 - Store-all semantic memory can grow; monitor `~/.openclaw/seva/data/`.
+
+## Stage 1 Verification
+
+Providers are configurable via `verification.providers` (ordered).
+
+- `wikipedia` (Wikidata/Wikipedia)
+- `sympy` (local math checks)
+- `wolfram` (Wolfram|Alpha evidence; requires AppID)
+
