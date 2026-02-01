@@ -84,7 +84,8 @@ function helpText() {
     "- /seva mode <name>         (set mode)",
     "- /seva mode list           (best-effort list)",
     "- /seva recall [k] <query>",
-    "- /seva verify <claim>",
+    "- /seva verify [--provider <name>] [--all] <claim>",
+    "- /seva wolfram status|on|off|set <appid>",
     "- /seva doctor",
     "",
     "Notes:",
@@ -249,6 +250,68 @@ export default function register(api: any) {
             return { text: `SEVA mode set: ${result.mode}` };
           }
           return { text: formatJsonPreview(result) };
+        }
+
+        if (subcmd === "wolfram") {
+          const action = String(restTokens[0] ?? "status").toLowerCase();
+
+          const readWolframStatus = async () => {
+            const config = await fetchJson({ baseUrl, path: "/config", timeoutMs });
+            const w = config?.verification?.wolfram ?? {};
+            const enabled = Boolean(w?.enabled);
+            const appid = String(w?.appid ?? "").trim();
+            const hasAppid = appid.length > 0;
+            const masked = hasAppid ? `${appid.slice(0, 4)}…${appid.slice(-3)}` : "<unset>";
+            return { enabled, hasAppid, masked };
+          };
+
+          if (action === "status") {
+            const s = await readWolframStatus();
+            return { text: `wolfram.enabled: ${s.enabled}\nwolfram.appid: ${s.masked}` };
+          }
+
+          if (action === "on") {
+            const s = await readWolframStatus();
+            if (!s.hasAppid) {
+              return { text: "Wolfram is missing an AppID. Set it first:\n/seva wolfram set <appid>" };
+            }
+            const config = await fetchJson({
+              baseUrl,
+              path: "/config-set",
+              method: "POST",
+              body: { set: ["verification.wolfram.enabled=true"] },
+              timeoutMs,
+            });
+            return { text: `Wolfram enabled.\n\n${formatJsonPreview(config, 900)}` };
+          }
+
+          if (action === "off") {
+            const config = await fetchJson({
+              baseUrl,
+              path: "/config-set",
+              method: "POST",
+              body: { set: ["verification.wolfram.enabled=false"] },
+              timeoutMs,
+            });
+            return { text: `Wolfram disabled.\n\n${formatJsonPreview(config, 900)}` };
+          }
+
+          if (action === "set") {
+            const appid = restTokens.slice(1).join(" ").trim();
+            if (!appid) {
+              return { text: "Usage: /seva wolfram set <appid>" };
+            }
+            const config = await fetchJson({
+              baseUrl,
+              path: "/config-set",
+              method: "POST",
+              body: { set: [`verification.wolfram.appid=${appid}`, "verification.wolfram.enabled=true"] },
+              timeoutMs,
+            });
+            return { text: `Wolfram AppID set and enabled.\n\n${formatJsonPreview(config, 900)}` };
+          }
+
+          return { text: "Usage: /seva wolfram status|on|off|set <appid>" };
         }
 
         if (subcmd === "recall") {

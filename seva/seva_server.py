@@ -149,6 +149,22 @@ class SevaService:
 
     def refresh_cfg(self) -> None:
         new_cfg = load_config()
+
+        # Auto-disable Wolfram if enabled but no AppID is configured.
+        # This prevents "enabled=true" from silently doing nothing.
+        try:
+            vcfg = new_cfg.get("verification", {}) if isinstance(new_cfg.get("verification", {}), dict) else {}
+            wcfg = vcfg.get("wolfram", {}) if isinstance(vcfg.get("wolfram", {}), dict) else {}
+            wolfram_enabled = bool(wcfg.get("enabled", False))
+            wolfram_appid = (str(wcfg.get("appid", "")) or os.environ.get("WOLFRAM_APPID", "")).strip()
+            if wolfram_enabled and not wolfram_appid:
+                wcfg["enabled"] = False
+                vcfg["wolfram"] = wcfg
+                new_cfg["verification"] = vcfg
+                save_config(new_cfg)
+        except Exception:
+            pass
+
         new_model = new_cfg.get("memory", {}).get("embed_model", "all-MiniLM-L6-v2")
         if getattr(self, '_embed_model', None) != new_model:
             self._embed_model = new_model

@@ -17,10 +17,10 @@ openclaw gateway restart
 - `/seva mode list`
 - `/seva mode lite|standard|pro`
 - `/seva recall [k] <query>`
-- `/seva verify <claim>`
-- `/seva verify --provider sympy <claim>`
-- `/seva verify --provider wolfram <claim>`
-- `/seva verify --all <claim>`
+- `/seva verify [--provider <name>] [--all] <claim>`
+- `/seva wolfram status`
+- `/seva wolfram set <appid>`
+- `/seva wolfram on | off`
 
 ## Plugin config
 

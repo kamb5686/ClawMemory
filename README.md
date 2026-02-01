@@ -53,7 +53,14 @@ Or in chat:
 Works well for entity/date-style claims.
 
 ### Wolfram|Alpha (optional)
-Enable by setting:
+Enable by setting an AppID. If `verification.wolfram.enabled=true` but no AppID is configured, SEVA will **auto-disable** Wolfram on next config refresh.
+
+You can set it in chat:
+
+- `/seva wolfram set <YOUR_APPID>`
+- `/seva wolfram status`
+
+Or by config keys:
 
 - `verification.wolfram.enabled=true`
 - `verification.wolfram.appid=<YOUR_APPID>`
